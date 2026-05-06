@@ -31,6 +31,13 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
 STORY_DIR = PROJECT_ROOT / "story-md"
 
+# ─────────────────────────────────────────────
+# Parent Features (Epics)
+# Keys are resolved dynamically from JIRA at runtime via JQL.
+# Only update these names if your Epic summaries change.
+# ─────────────────────────────────────────────
+PARENT_FEATURE_NAMES = ["Migration_LACA", "Migration_PERU"]
+
 
 def load_config() -> dict:
     """Load and validate JIRA config from .env."""
@@ -309,9 +316,49 @@ def _auth_header(email: str, token: str) -> str:
     return f"Basic {credentials}"
 
 
-def create_jira_story(config: dict, story: dict) -> tuple[str, str]:
+def resolve_epic_keys(config: dict, names: list) -> list:
+    """
+    Look up current JIRA Epic keys by their exact summary names using JQL.
+    Returns a list of {"key": "KAN-xxx", "name": "..."} dicts.
+    Warns and skips any name that cannot be resolved.
+    """
+    headers = {
+        "Authorization": _auth_header(config["JIRA_EMAIL"], config["JIRA_API_TOKEN"]),
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    url = f"{config['JIRA_BASE_URL']}/rest/api/3/search/jql"
+    resolved = []
+    for name in names:
+        jql = f'project = "{config["JIRA_PROJECT"]}" AND issuetype = Epic AND summary ~ "\\"{name}\\""'
+        try:
+            resp = requests.post(
+                url,
+                headers=headers,
+                json={"jql": jql, "fields": ["summary"], "maxResults": 1},
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                issues = resp.json().get("issues", [])
+                if issues:
+                    resolved.append({"key": issues[0]["key"], "name": name})
+                else:
+                    print(f"  ⚠ Warning: No Epic with summary '{name}' found in project "
+                          f"{config['JIRA_PROJECT']} — skipping.")
+            else:
+                print(f"  ⚠ Warning: Could not look up Epic '{name}': "
+                      f"HTTP {resp.status_code} — skipping.")
+        except Exception as exc:
+            print(f"  ⚠ Warning: Error looking up Epic '{name}': {exc} — skipping.")
+    return resolved
+
+
+def create_jira_story(config: dict, story: dict, epic_key: str = "") -> tuple[str, str]:
     """
     POST a new JIRA Story issue.
+
+    Args:
+        epic_key: JIRA epic key to link this story to (overrides JIRA_FEATURE in config).
 
     Returns:
         (issue_key, issue_url)
@@ -335,12 +382,24 @@ def create_jira_story(config: dict, story: dict) -> tuple[str, str]:
         }
     }
 
-    # Link to epic if JIRA_FEATURE is set
-    if config.get("JIRA_FEATURE"):
-        # customfield_10014 is the standard Epic Link field for Atlassian Cloud
-        payload["fields"]["customfield_10014"] = config["JIRA_FEATURE"]
+    # Link to parent Epic.
+    # Team-managed (next-gen) projects use the "parent" field.
+    # Company-managed projects use customfield_10014 (Epic Link).
+    # Try "parent" first; fall back to customfield_10014 on 400.
+    resolved_parent = epic_key or config.get("JIRA_FEATURE", "")
+    if resolved_parent:
+        payload["fields"]["parent"] = {"key": resolved_parent}
 
     response = requests.post(url, headers=headers, json=payload, timeout=30)
+
+    # If "parent" field is rejected, fall back to customfield_10014
+    if response.status_code == 400:
+        error_body = response.json()
+        errors = error_body.get("errors", {})
+        if "parent" in errors and resolved_parent:
+            payload["fields"].pop("parent")
+            payload["fields"]["customfield_10014"] = resolved_parent
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
 
     if response.status_code in (200, 201):
         data = response.json()
@@ -387,30 +446,48 @@ def main():
             print(f"No markdown files found in: {STORY_DIR}", file=sys.stderr)
             sys.exit(1)
 
-    print(f"Found {len(files)} story file(s) → project {config['JIRA_PROJECT']}\n")
-    if config.get("JIRA_FEATURE"):
-        print(f"Linking to epic: {config['JIRA_FEATURE']}\n")
+    print(f"Found {len(files)} story file(s) → project {config['JIRA_PROJECT']}")
+    print("Resolving Epic keys from JIRA...")
+    parents = resolve_epic_keys(config, PARENT_FEATURE_NAMES)
+    if not parents:
+        print("No valid parent Epics found. Aborting.", file=sys.stderr)
+        sys.exit(1)
+    print(f"Will create each story {len(parents)} time(s) for parent features: "
+          f"{', '.join(p['name'] + ' (' + p['key'] + ')' for p in parents)}\n")
 
     results = []
     for filepath in files:
-        print(f"  Processing: {filepath.name}")
-        try:
-            story = parse_story(filepath)
-            key, issue_url = create_jira_story(config, story)
-            print(f"  ✓ Created {key}: {story['summary']}")
-            print(f"    {issue_url}\n")
-            results.append({"file": filepath.name, "key": key, "status": "created"})
-        except Exception as exc:
-            print(f"  ✗ Failed: {exc}\n")
-            results.append({"file": filepath.name, "key": None, "status": f"error: {exc}"})
+        story = parse_story(filepath)
+        print(f"Processing: {filepath.name} — '{story['summary']}'")
+        for parent in parents:
+            print(f"  → Epic {parent['key']} ({parent['name']})")
+            try:
+                key, issue_url = create_jira_story(config, story, epic_key=parent["key"])
+                print(f"    ✓ Created {key}")
+                print(f"      {issue_url}")
+                results.append({
+                    "file": filepath.name,
+                    "epic": parent["name"],
+                    "key": key,
+                    "status": "created",
+                })
+            except Exception as exc:
+                print(f"    ✗ Failed: {exc}")
+                results.append({
+                    "file": filepath.name,
+                    "epic": parent["name"],
+                    "key": None,
+                    "status": f"error: {exc}",
+                })
+        print()
 
     # Summary table
-    print("=" * 50)
+    print("=" * 60)
     print("Summary")
-    print("=" * 50)
+    print("=" * 60)
     for r in results:
         badge = f"[{r['key']}]" if r["key"] else "[FAILED]"
-        print(f"  {badge:<12} {r['file']} — {r['status']}")
+        print(f"  {badge:<12} {r['file']} / {r['epic']} — {r['status']}")
 
     failed = [r for r in results if not r["key"]]
     sys.exit(1 if failed else 0)
